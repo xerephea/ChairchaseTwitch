@@ -1,4 +1,6 @@
+import csv
 import json
+from datetime import datetime, timedelta, timezone
 import os
 import sys
 import time
@@ -14,8 +16,14 @@ YOUTUBE_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 GAME_NAME = os.environ.get("GAME_NAME", "Chair Chase")
 GAME_ID = os.environ.get("GAME_ID", "")
 SEEN_FILE = "seen.json"
+HISTORY_FILE = "history.csv"
+TR_TZ = timezone(timedelta(hours=3))
 UA = "ChairChaseNotifier/1.0"
 YOUTUBE_INTERVAL = 15 * 60  # YouTube kotasi icin en fazla 15 dakikada bir
+CHZZK_KEYWORDS = [k.strip() for k in os.environ.get("CHZZK_KEYWORDS", GAME_NAME).split(",") if k.strip()]
+BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", 50 * 60))  # her calistirma bu kadar sure acik kalir
+CHECK_EVERY = 3 * 60  # bu sure icinde kac saniyede bir kontrol edilecegi
 
 
 def get_json(url, headers=None):
@@ -53,7 +61,17 @@ def send_discord(url, payload):
     urllib.request.urlopen(req, timeout=20).close()
 
 
+def log_history(platform, user, link, title, viewers):
+    new_file = not os.path.exists(HISTORY_FILE)
+    with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow(["time_tr", "platform", "streamer", "viewers_at_start", "link", "title"])
+        w.writerow([datetime.now(TR_TZ).strftime("%Y-%m-%d %H:%M"), platform, user, viewers, link, title])
+
+
 def notify(platform, user, link, title, viewers, extra_field, thumb, color):
+    log_history(platform, user, link, title, viewers)
     embed = {
         "title": (title or "Live stream")[:256],
         "url": link,
@@ -91,6 +109,7 @@ def load_state():
     return {
         "twitch": set(data.get("twitch", [])),
         "youtube": set(data.get("youtube", [])),
+        "chzzk": set(data.get("chzzk", [])),
         "yt_last": data.get("yt_last", 0),
     }
 
@@ -100,6 +119,7 @@ def save_state(state):
         json.dump({
             "twitch": sorted(state["twitch"]),
             "youtube": sorted(state["youtube"]),
+            "chzzk": sorted(state["chzzk"]),
             "yt_last": state["yt_last"],
         }, f)
 
@@ -175,40 +195,85 @@ def check_youtube(state):
     print(f"YouTube canli yayin sayisi: {len(current)}")
 
 
+def norm(text):
+    return "".join(str(text or "").lower().split())
+
+
+def check_chzzk(state):
+    found = {}
+    for kw in CHZZK_KEYWORDS:
+        url = "https://api.chzzk.naver.com/service/v1/search/lives?" + urllib.parse.urlencode(
+            {"keyword": kw, "offset": 0, "size": 50})
+        res = get_json(url, {"User-Agent": BROWSER_UA, "Accept": "application/json"})
+        for item in (res.get("content") or {}).get("data") or []:
+            live = item.get("live") or {}
+            ch = item.get("channel") or {}
+            cid = ch.get("channelId")
+            if not cid:
+                continue
+            haystack = norm(live.get("liveTitle")) + " " + norm(live.get("liveCategoryValue")) + " " + \
+                " ".join(norm(t) for t in (live.get("tags") or []))
+            if norm(kw) not in haystack:
+                continue
+            key = f"{cid}:{live.get('liveId') or live.get('openDate') or ''}"
+            found[key] = (ch, live)
+
+    for key, (ch, live) in found.items():
+        if key in state["chzzk"]:
+            continue
+        thumb = (live.get("liveImageUrl") or "").replace("{type}", "480")
+        notify("CHZZK", ch.get("channelName") or "?", f"https://chzzk.naver.com/live/{ch['channelId']}",
+               live.get("liveTitle"), live.get("concurrentUserCount", "?"), None, thumb, 0x00FFA3)
+    state["chzzk"] = set(found)
+    print(f"CHZZK canli yayin sayisi: {len(found)}")
+
+
+def run_once(state):
+    check_twitch(state)
+    try:
+        check_chzzk(state)
+    except Exception as e:  # resmi olmayan API, hata verse de digerlerini durdurmasin
+        print(f"CHZZK kontrol edilemedi ({e}).")
+    if YOUTUBE_KEY and time.time() - state["yt_last"] >= YOUTUBE_INTERVAL:
+        state["yt_last"] = int(time.time())
+        try:
+            check_youtube(state)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="ignore")
+            if e.code == 403 and "quota" in body.lower():
+                print("YouTube gunluk kotasi doldu, yarin devam edecek.")
+            elif e.code == 429 or e.code >= 500:
+                print(f"YouTube gecici hata ({e.code}).")
+            else:
+                return f"YouTube hatasi {e.code}: {body[:300]}"
+        except (urllib.error.URLError, TimeoutError) as e:
+            print(f"YouTube baglanti hatasi ({e}).")
+    return None
+
+
 def main():
     state = load_state()
-    youtube_failed = None
-    try:
-        check_twitch(state)
-        if YOUTUBE_KEY and time.time() - state["yt_last"] >= YOUTUBE_INTERVAL:
-            state["yt_last"] = int(time.time())
-            try:
-                check_youtube(state)
-            except urllib.error.HTTPError as e:
-                body = e.read().decode(errors="ignore")
-                if e.code == 403 and "quota" in body.lower():
-                    print("YouTube gunluk kotasi doldu, yarin devam edecek.")
-                elif e.code == 429 or e.code >= 500:
-                    print(f"YouTube gecici hata ({e.code}).")
-                else:
-                    youtube_failed = f"YouTube hatasi {e.code}: {body[:300]}"
-            except (urllib.error.URLError, TimeoutError) as e:
-                print(f"YouTube baglanti hatasi ({e}).")
-    finally:
+    end = time.time() + RUN_SECONDS
+    while True:
+        error = None
+        try:
+            error = run_once(state)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 or e.code >= 500:
+                print(f"Gecici hata ({e.code}), sonraki turda tekrar denenecek.")
+            else:
+                save_state(state)
+                raise
+        except (urllib.error.URLError, TimeoutError) as e:
+            print(f"Baglanti hatasi ({e}), sonraki turda tekrar denenecek.")
         save_state(state)
-    if youtube_failed:
-        print(youtube_failed)
-        sys.exit(1)
+        if error:
+            print(error)
+            sys.exit(1)
+        if time.time() + CHECK_EVERY > end:
+            break
+        time.sleep(CHECK_EVERY)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except urllib.error.HTTPError as e:
-        if e.code == 429 or e.code >= 500:
-            print(f"Gecici hata ({e.code}), sonraki turda tekrar denenecek.")
-            sys.exit(0)
-        raise
-    except (urllib.error.URLError, TimeoutError) as e:
-        print(f"Baglanti hatasi ({e}), sonraki turda tekrar denenecek.")
-        sys.exit(0)
+    main()
