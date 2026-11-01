@@ -22,7 +22,7 @@ UA = "ChairChaseNotifier/1.0"
 YOUTUBE_INTERVAL = 15 * 60  # YouTube kotasi icin en fazla 15 dakikada bir
 CHZZK_KEYWORDS = [k.strip() for k in os.environ.get("CHZZK_KEYWORDS", GAME_NAME).split(",") if k.strip()]
 BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-RUN_SECONDS = int(os.environ.get("RUN_SECONDS", 50 * 60))  # her calistirma bu kadar sure acik kalir
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", 340 * 60))  # her calistirma bu kadar sure acik kalir
 CHECK_EVERY = 3 * 60  # bu sure icinde kac saniyede bir kontrol edilecegi
 
 
