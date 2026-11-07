@@ -52,13 +52,30 @@ def twitch_get(path, params, token):
 
 
 def send_discord(url, payload):
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={"User-Agent": UA, "Content-Type": "application/json"},
-        method="POST",
-    )
-    urllib.request.urlopen(req, timeout=20).close()
+    data = json.dumps(payload).encode()
+    for attempt in range(5):
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"User-Agent": UA, "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=20).close()
+            time.sleep(2.2)  # Discord kanal siniri: dakikada ~30 mesaj
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 429 or e.code >= 500:
+                try:
+                    wait = float(e.headers.get("Retry-After") or 0)
+                except ValueError:
+                    wait = 0
+                wait = max(wait, 3 * (attempt + 1))
+                print(f"Discord yogun ({e.code}), {wait:.0f} sn bekleniyor.")
+                time.sleep(min(wait, 60))
+                continue
+            raise
+    raise RuntimeError("Discord'a gonderilemedi (cok fazla deneme).")
 
 
 def log_history(platform, user, link, title, viewers):
@@ -71,17 +88,17 @@ def log_history(platform, user, link, title, viewers):
 
 
 def notify(platform, user, link, title, viewers, extra_field, thumb, color):
-    log_history(platform, user, link, title, viewers)
     embed = {
         "title": (title or "Live stream")[:256],
         "url": link,
         "color": color,
         "fields": [
             {"name": "Platform", "value": platform, "inline": True},
-            {"name": "Viewers", "value": str(viewers), "inline": True},
+            {"name": "Viewers", "value": str(viewers if viewers not in (None, "") else "?"), "inline": True},
         ],
-        "image": {"url": thumb},
     }
+    if thumb and str(thumb).startswith("http"):
+        embed["image"] = {"url": thumb}
     if extra_field:
         embed["fields"].append(extra_field)
     send_discord(WEBHOOK, {
@@ -89,13 +106,22 @@ def notify(platform, user, link, title, viewers, extra_field, thumb, color):
         "embeds": [embed],
     })
     if WEBHOOK_PUBLIC:
-        time.sleep(1)
         send_discord(WEBHOOK_PUBLIC, {
             "content": f"🎮 **{user}** is playing Chair Chase on {platform} right now! Stop by and say hi 👋",
             "embeds": [embed],
         })
+    log_history(platform, user, link, title, viewers)
     print(f"Bildirim gonderildi ({platform}):", user)
-    time.sleep(1)
+
+
+def safe_notify(*args):
+    """Tek bir yayinin bildirimi basarisiz olursa digerlerini engellemesin."""
+    try:
+        notify(*args)
+        return True
+    except Exception as e:
+        print(f"Bildirim gonderilemedi ({args[0]} / {args[1]}): {e}. Sonraki turda tekrar denenecek.")
+        return False
 
 
 def load_state():
@@ -147,15 +173,18 @@ def check_twitch(state):
             break
 
     current = set()
+    failed = set()
     for s in streams:
         current.add(s["id"])
         if s["id"] in state["twitch"]:
             continue
-        thumb = s["thumbnail_url"].replace("{width}", "640").replace("{height}", "360")
-        notify("Twitch", s["user_name"], f"https://twitch.tv/{s['user_login']}", s["title"],
+        thumb = (s.get("thumbnail_url") or "").replace("{width}", "640").replace("{height}", "360")
+        ok = safe_notify("Twitch", s["user_name"], f"https://twitch.tv/{s['user_login']}", s["title"],
                s["viewer_count"], {"name": "Language", "value": s.get("language") or "?", "inline": True},
                thumb, 0x9146FF)
-    state["twitch"] = current
+        if not ok:
+            failed.add(s["id"])
+    state["twitch"] = current - failed
     print(f"Twitch canli yayin sayisi: {len(current)}")
 
 
@@ -181,6 +210,7 @@ def check_youtube(state):
             viewers[v["id"]] = v.get("liveStreamingDetails", {}).get("concurrentViewers", "?")
 
     current = set()
+    failed = set()
     for i in items:
         vid = i["id"]["videoId"]
         current.add(vid)
@@ -189,9 +219,11 @@ def check_youtube(state):
         sn = i["snippet"]
         thumbs = sn.get("thumbnails", {})
         thumb = (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url", "")
-        notify("YouTube", sn["channelTitle"], f"https://www.youtube.com/watch?v={vid}", sn["title"],
+        ok = safe_notify("YouTube", sn.get("channelTitle") or "?", f"https://www.youtube.com/watch?v={vid}", sn["title"],
                viewers.get(vid, "?"), None, thumb, 0xFF0000)
-    state["youtube"] = current
+        if not ok:
+            failed.add(vid)
+    state["youtube"] = current - failed
     print(f"YouTube canli yayin sayisi: {len(current)}")
 
 
@@ -218,13 +250,16 @@ def check_chzzk(state):
             key = f"{cid}:{live.get('liveId') or live.get('openDate') or ''}"
             found[key] = (ch, live)
 
+    failed = set()
     for key, (ch, live) in found.items():
         if key in state["chzzk"]:
             continue
         thumb = (live.get("liveImageUrl") or "").replace("{type}", "480")
-        notify("CHZZK", ch.get("channelName") or "?", f"https://chzzk.naver.com/live/{ch['channelId']}",
+        ok = safe_notify("CHZZK", ch.get("channelName") or "?", f"https://chzzk.naver.com/live/{ch['channelId']}",
                live.get("liveTitle"), live.get("concurrentUserCount", "?"), None, thumb, 0x00FFA3)
-    state["chzzk"] = set(found)
+        if not ok:
+            failed.add(key)
+    state["chzzk"] = set(found) - failed
     print(f"CHZZK canli yayin sayisi: {len(found)}")
 
 
@@ -245,7 +280,14 @@ def run_once(state):
             elif e.code == 429 or e.code >= 500:
                 print(f"YouTube gecici hata ({e.code}).")
             else:
-                return f"YouTube hatasi {e.code}: {body[:300]}"
+                msg = f"YouTube hatasi {e.code}: {body[:300]}"
+                print(msg)
+                if not state.get("yt_alerted"):
+                    state["yt_alerted"] = True
+                    try:
+                        send_discord(WEBHOOK, {"content": f"⚠️ YouTube check is failing, Twitch and CHZZK still work.\n```{msg[:1500]}```"})
+                    except Exception:
+                        pass
         except (urllib.error.URLError, TimeoutError) as e:
             print(f"YouTube baglanti hatasi ({e}).")
     return None
@@ -254,21 +296,24 @@ def run_once(state):
 def main():
     state = load_state()
     end = time.time() + RUN_SECONDS
+    fails = 0
     while True:
         error = None
         try:
             error = run_once(state)
-        except urllib.error.HTTPError as e:
-            if e.code == 429 or e.code >= 500:
-                print(f"Gecici hata ({e.code}), sonraki turda tekrar denenecek.")
-            else:
-                save_state(state)
-                raise
-        except (urllib.error.URLError, TimeoutError) as e:
-            print(f"Baglanti hatasi ({e}), sonraki turda tekrar denenecek.")
+            fails = 0
+        except SystemExit:
+            save_state(state)
+            raise
+        except Exception as e:
+            fails += 1
+            print(f"Kontrol sirasinda hata ({type(e).__name__}: {e}), sonraki turda tekrar denenecek. [{fails}]")
         save_state(state)
         if error:
             print(error)
+            sys.exit(1)
+        if fails >= 10:  # ~30 dakikadir surekli hata: gercek bir sorun var, mail gitsin
+            print("Uzun suredir surekli hata aliniyor, workflow durduruluyor.")
             sys.exit(1)
         if time.time() + CHECK_EVERY > end:
             break
